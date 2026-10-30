@@ -38,7 +38,8 @@ SIZE_NAMES = {"orig": "Original", "large": "Large", "medium": "Medium", "small":
 VARIANT_RE = re.compile(r"~(orig|large|medium|small|thumb)\.(\w+)$", re.IGNORECASE)
 
 VIEWS = ["Search the archive", "Picture of the Day"]
-APOD_URL = "https://api.nasa.gov/planetary/apod"
+APOD_URL = "https://api.nasa.gov/planetary/apod"                        # needs a key; DEMO_KEY allows ~10 calls/hour
+APOD_WP_URL = "https://science.nasa.gov/wp-json/wp/v2/image-article"   # APOD's current home: open JSON, no key
 APOD_FIRST = date(1995, 6, 16)
 YOUTUBE_EMBED_RE = re.compile(r"^https://(?:www\.)?youtube(?:-nocookie)?\.com/embed/([\w-]{6,})")
 
@@ -199,6 +200,57 @@ def parse_apod(d: Any) -> dict | None:
     }
 
 
+def _apod_media_url(u: str) -> str:
+    return safe_url(html.unescape(u))
+
+
+def _tidy(text: str) -> str:
+    """Close the gaps tag-stripping leaves before punctuation ('nebulas , which' -> 'nebulas, which')."""
+    return re.sub(r"\s+([,.;:!?)])", r"\1", text).strip()
+
+
+def parse_apod_post(p: Any) -> dict | None:
+    """One NASA Science 'image-article' APOD post -> the same fields parse_apod returns (plus its page link)."""
+    if not isinstance(p, dict):
+        return None
+    title = clean_text((p.get("title") or {}).get("rendered"))
+    if not title.startswith("APOD"):
+        return None
+    try:
+        day = date.fromisoformat(str(p.get("date"))[:10])
+    except ValueError:
+        return None
+    body = str((p.get("content") or {}).get("rendered") or "")
+    text = re.sub(r"\s+", " ", clean_text(body))
+    explanation, credit = "", ""
+    m = re.search(r"Explanation:\s*(.*?)\s+Date\b", text)
+    if m:
+        explanation = re.sub(r"\s+(?:Tomorrow.s picture:|Follow APOD on:|Your Sky Surprise:).*$", "", m.group(1))
+        c = re.search(r"\bCredit\b\s*(.*?)\s+Authors & editors", text[m.end():])
+        if c:
+            credit = re.sub(r"^(?:Image\s+)?(?:Credit\s*)?(?:&\s*Copyright\s*)?:?\s*", "", c.group(1))
+    videos = [_apod_media_url(u) for u in re.findall(r'<(?:iframe|video|source)\b[^>]*\bsrc="([^"]+)"', body)]
+    images = [_apod_media_url(u) for u in re.findall(r'<img\b[^>]*\bsrc="([^"]+)"', body) if "/apod/" in u]
+    hd = next((_apod_media_url(u) for u in re.findall(r'<a\b[^>]*\bhref="([^"]+)"', body)
+               if "/apod/" in u and re.search(r"\.(?:jpe?g|png|gif|tiff?)$", u.split("?")[0], re.I)), "")
+    image = images[0].split("?")[0] if images and images[0] else ""
+    if image and "assets.science.nasa.gov" in image and not image.lower().endswith(".gif"):
+        image += "?w=1600&fit=clip"                 # NASA's image CDN resizes on request; originals can be 20+ MB
+    video = next((v for v in videos if v), "")
+    yt = YOUTUBE_EMBED_RE.match(video)
+    return {
+        "date": day,
+        "title": re.split(r"\s[–—-]\s", title, maxsplit=1)[-1].strip(),
+        "explanation": _tidy(explanation),
+        "media_type": "video" if video else "image" if image else "other",
+        "url": f"https://www.youtube.com/watch?v={yt.group(1)}" if yt else video or image,
+        "hdurl": hd,
+        "thumb": image,
+        "credit": _tidy(credit),
+        "page": safe_url(p.get("link")),
+    }
+
+
 def apod_page(day: date) -> str:
     return f"https://apod.nasa.gov/apod/ap{day:%y%m%d}.html"
 
@@ -265,16 +317,41 @@ def nasa_api_key() -> str:
     return str(key or os.environ.get("NASA_API_KEY") or "DEMO_KEY")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_apod(day: str = "") -> dict:
-    """Astronomy Picture of the Day for an ISO date ('' = the most recent one)."""
+def _apod_from_api(day: str) -> dict:
     params = {"api_key": nasa_api_key(), "thumbs": "true"}
     if day:
         params["date"] = day
-    item = parse_apod(_get_json(APOD_URL, params, service="NASA's Picture of the Day service"))
+    item = parse_apod(_get_json(APOD_URL, params, service="NASA's APOD API"))
     if item is None:
-        raise ApiError("NASA's Picture of the Day service returned an unexpected response.")
+        raise ApiError("NASA's APOD API returned an unexpected response.")
     return item
+
+
+def _apod_from_nasa_science(day: str) -> dict:
+    params = {"search": "APOD", "per_page": 5, "_fields": "date,title,content,link"}
+    if day:
+        d = date.fromisoformat(day)
+        params.update(after=f"{d - timedelta(days=1)}T23:59:59", before=f"{day}T23:59:59")
+    data = _get_json(APOD_WP_URL, params, service="NASA Science")
+    if not isinstance(data, list):
+        raise ApiError("NASA Science returned an unexpected response.")
+    for post in data:
+        item = parse_apod_post(post)
+        if item and (not day or item["date"].isoformat() == day):
+            return item
+    raise ApiError(f"NASA has no Picture of the Day for {day}." if day else "NASA Science returned no recent pictures.")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_apod(day: str = "") -> dict:
+    """Astronomy Picture of the Day for an ISO date ('' = the most recent one). Uses the APOD API when a personal
+    NASA_API_KEY is set, and NASA Science's open feed otherwise (or if the API fails)."""
+    if nasa_api_key() != "DEMO_KEY":
+        try:
+            return _apod_from_api(day)
+        except ApiError:
+            pass
+    return _apod_from_nasa_science(day)
 
 
 # ───────────────────────────── State and callbacks ─────────────────────────────
@@ -553,9 +630,7 @@ def render_apod() -> None:
             latest = get_apod()
     except ApiError as e:
         st.error(f"Could not load the Astronomy Picture of the Day. {e}")
-        if nasa_api_key() == "DEMO_KEY":
-            st.caption("This app is using NASA's shared DEMO_KEY, which allows only a few requests per hour. Get a free key at "
-                       "[api.nasa.gov](https://api.nasa.gov) and set it as `NASA_API_KEY` in `.streamlit/secrets.toml` or the environment.")
+        st.caption("Pictures load from [NASA Science](https://science.nasa.gov/apod/); check that the site opens in your browser.")
         return
     last = latest["date"]
     ss["_apod_latest"] = last
@@ -603,9 +678,10 @@ def render_apod() -> None:
         with st.container(horizontal=True):
             if item["hdurl"]:
                 st.link_button("Full resolution", item["hdurl"])
-            st.link_button("Open on apod.nasa.gov", apod_page(day))
+            st.link_button("Open on NASA's site", item.get("page") or apod_page(day))
         st.markdown(md_escape(item["explanation"] or "No explanation available."))
-    st.caption("Astronomy Picture of the Day is curated by NASA since 16 June 1995. The page URL points to this date, so you can share it.")
+    st.caption("Astronomy Picture of the Day has been curated by NASA since 16 June 1995; pictures load from its home on "
+               "[NASA Science](https://science.nasa.gov/apod/), no API key needed. The page URL points to this date, so you can share it.")
 
 
 def main() -> None:

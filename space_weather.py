@@ -425,10 +425,60 @@ def render_alerts() -> None:
             st.text(a["message"])
 
 
+AURORA_STEPS = [
+    ("1 · The Sun blows a wind",
+     "The Sun constantly streams charged particles into space, called the **solar wind**. It normally takes 2-4 days "
+     "to reach Earth. Big eruptions on the Sun (flares and coronal mass ejections) send faster, denser gusts."),
+    ("2 · Earth's magnetic shield",
+     "Earth's magnetic field deflects most of that wind. But when the wind's own magnetic field points **south** "
+     "(a negative **Bz**), the two fields connect and energy pours into our field, like a door opening."),
+    ("3 · The sky lights up",
+     "That energy funnels particles down near the poles, about 100-300 km up. They hit oxygen and nitrogen in the air, "
+     "which glow like a neon sign. That glow is the **aurora**: the northern or southern lights."),
+]
+
+AURORA_GUIDE = """
+**What colours will I see?** Mostly **green** (oxygen, ~100-250 km up). Strong displays add **red** on top (oxygen, higher up)
+and **pink or purple** fringes at the bottom (nitrogen). To the eye, faint auroras often look like grey-white clouds;
+a phone camera on night mode usually shows the colour.
+
+**Where?** Auroras form rings around the magnetic poles. Normally you need to be far north or south, such as Iceland,
+northern Norway, Finland, Alaska, northern Canada, or southern New Zealand and Tasmania. During big storms the ring
+grows toward the equator, and auroras can be seen much further south (or north, in the southern hemisphere).
+
+**When?** On a dark, clear night, away from city lights, usually between about 10 pm and 2 am. Moonlight and clouds
+make it much harder. Check the forecast map below: it shows the chance of aurora overhead for the next hour or so.
+
+**What do the numbers on this page mean?**
+- **Kp index (0-9):** how stirred-up Earth's magnetic field is. 0-2 is quiet, 4 is active, **5 or more is a geomagnetic storm**.
+  Higher Kp means auroras reach further from the poles.
+- **Solar wind speed:** around 400 km/s is normal. **500+ km/s** is fast and helps power auroras.
+- **Bz:** the north-south direction of the solar wind's magnetic field. **Negative (south) is good for auroras**;
+  -10 nT or lower for a few hours can trigger a storm.
+- **X-ray flux / flare class:** how bright the Sun is in X-rays. Classes go A, B, C, M, X, each 10× stronger.
+  M and X flares can disrupt radio on Earth's sunlit side, and may be followed by an eruption that reaches us days later.
+
+**Is space weather dangerous?** Not to people on the ground: our atmosphere and magnetic field protect us. Strong
+storms can disturb GPS, radio, satellites and power grids, which is why NOAA watches the Sun around the clock.
+"""
+
+
+def render_intro() -> None:
+    st.markdown("**Space weather** is what the Sun is doing to the space around Earth. This page tracks it live, and tells you "
+                "whether you might see an **aurora**: the glowing curtains of light in the night sky near the poles.")
+    with st.expander("New to auroras? What they are, how to see one, and what these numbers mean"):
+        for col, (head, body) in zip(st.columns(3), AURORA_STEPS):
+            with col, st.container(border=True, key=f"card_step_{head[0]}"):
+                st.markdown(f"**{head}**")
+                st.markdown(body)
+        st.markdown(AURORA_GUIDE)
+
+
 def main() -> None:
     st.set_page_config(page_title="Space Weather", page_icon="🌌", layout="wide")
     eyebrow("Live from NOAA SWPC")
     st.title("Space Weather & Aurora")
+    render_intro()
     cols = st.columns([1, 1, 4])
     live = cols[0].toggle("Live updates", value=True, help="Refresh the readings every minute.")
     if cols[1].button("Refresh now"):
