@@ -168,6 +168,11 @@ h4 { font: 600 0.76rem/1.2 var(--body) !important; letter-spacing: 0.14em; text-
 
 [data-testid="stImage"] img { border-radius: 10px; transition: transform 0.4s ease; }
 [data-testid="stImage"] img:hover { transform: scale(1.02); }
+/* uniform grid thumbnails: crop to one shape so card rows line up */
+[class*="st-key-card_img"] [data-testid="stImage"] img, [class*="st-key-card_rel"] [data-testid="stImage"] img {
+  width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+}
+[class*="st-key-card_person"] [data-testid="stImage"] img { width: 100%; aspect-ratio: 4 / 5; object-fit: cover; object-position: top; }
 [data-testid="stDeckGlJsonChart"], [data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 [data-testid="stExpander"] details { border: 1px solid var(--line) !important; border-radius: 12px !important; background: var(--surface); }
 [data-testid="stExpander"] summary p { font-weight: 500; }

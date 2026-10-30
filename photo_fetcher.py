@@ -3,22 +3,20 @@ from __future__ import annotations
 
 import html
 import math
+import os
 import random
 import re
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote
 
-import requests
 import streamlit as st
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
+from common import ApiError, get_json as _get_json, md_escape, safe_url
 from theme import eyebrow, facts_html
 
 API = "https://images-api.nasa.gov"
-TIMEOUT = 15
 PAGE_SIZE = 24
 MAX_HITS = 10_000            # the API will not page past this many results
 MAX_PAGE_SIZE = 100
@@ -39,9 +37,10 @@ SORTS = ["NASA's relevance order", "Newest first", "Oldest first"]
 SIZE_NAMES = {"orig": "Original", "large": "Large", "medium": "Medium", "small": "Small"}
 VARIANT_RE = re.compile(r"~(orig|large|medium|small|thumb)\.(\w+)$", re.IGNORECASE)
 
-
-class ApiError(Exception):
-    pass
+VIEWS = ["Search the archive", "Picture of the Day"]
+APOD_URL = "https://api.nasa.gov/planetary/apod"
+APOD_FIRST = date(1995, 6, 16)
+YOUTUBE_EMBED_RE = re.compile(r"^https://(?:www\.)?youtube(?:-nocookie)?\.com/embed/([\w-]{6,})")
 
 
 # ───────────────────────────── Pure helpers (no I/O) ─────────────────────────────
@@ -57,30 +56,8 @@ def clean_text(s: Any) -> str:
     return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
-def normalize_url(url: str) -> str:
-    """Return a safe HTTPS asset URL; NASA occasionally returns legacy HTTP URLs."""
-    try:
-        parts = urlsplit(str(url or "").strip())
-        if parts.scheme.lower() == "http":
-            parts = parts._replace(scheme="https")
-        if (parts.scheme.lower() != "https" or not parts.hostname
-                or parts.username or parts.password or parts.port not in (None, 443)):
-            return ""
-        return urlunsplit((parts.scheme.lower(), parts.netloc,
-                           quote(parts.path, safe="/%:@!$&'()*+,;=-._~%"),
-                           quote(parts.query, safe="/?@!$&'()*+,;=:-._~%"),
-                           quote(parts.fragment, safe="/?@!$&'()*+,;=:-._~%")))
-    except ValueError:
-        return ""
-
-
 def shorten(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
-
-
-def md_escape(text: str) -> str:
-    """Keep API text and user searches literal when inserted into Markdown."""
-    return re.sub(r"([\\`*_{}\[\]()<>#+\-.!|~$])", r"\\\1", text.replace("\r\n", "\n"))
 
 
 def center_name(code: str) -> str:
@@ -95,7 +72,7 @@ def parse_item(item: dict) -> dict | None:
     links = item.get("links") if isinstance(item.get("links"), list) else []
     thumb_raw = (next((l.get("href") for l in links if isinstance(l, dict) and l.get("render") == "image" and l.get("href")), None)
                  or next((l.get("href") for l in links if isinstance(l, dict) and l.get("href")), None))
-    thumb = normalize_url(thumb_raw)
+    thumb = safe_url(thumb_raw)
     nasa_id = meta.get("nasa_id")
     if not nasa_id or not thumb:
         return None
@@ -113,7 +90,7 @@ def parse_item(item: dict) -> dict | None:
         "keywords": [str(k).strip() for k in kws if str(k).strip()],
         "photographer": clean_text(meta.get("photographer") or meta.get("secondary_creator")),
         "location": clean_text(meta.get("location")),
-        "thumb": normalize_url(thumb),
+        "thumb": safe_url(thumb),
     }
 
 
@@ -127,7 +104,7 @@ def classify_assets(payload: Any) -> dict[str, str]:
     for it in items:
         if not isinstance(it, dict):
             continue
-        href = normalize_url(str(it.get("href", "")))
+        href = safe_url(str(it.get("href", "")))
         m = VARIANT_RE.search(href)
         if m:
             out.setdefault(m.group(1).lower(), href)
@@ -200,44 +177,40 @@ def page_count(total: int, page_size: int = PAGE_SIZE) -> int:
     return max(1, math.ceil(min(total, MAX_HITS) / page_size))
 
 
+def parse_apod(d: Any) -> dict | None:
+    """One APOD API record -> the fields the page shows."""
+    if not isinstance(d, dict) or not d.get("title") or not d.get("date"):
+        return None
+    try:
+        day = date.fromisoformat(str(d["date"])[:10])
+    except ValueError:
+        return None
+    url = safe_url(d.get("url"))
+    m = YOUTUBE_EMBED_RE.match(url)
+    return {
+        "date": day,
+        "title": clean_text(d.get("title")),
+        "explanation": clean_text(d.get("explanation")),
+        "media_type": str(d.get("media_type") or ""),
+        "url": f"https://www.youtube.com/watch?v={m.group(1)}" if m else url,
+        "hdurl": safe_url(d.get("hdurl")),
+        "thumb": safe_url(d.get("thumbnail_url")),
+        "credit": re.sub(r"\s+", " ", clean_text(d.get("copyright"))),
+    }
+
+
+def apod_page(day: date) -> str:
+    return f"https://apod.nasa.gov/apod/ap{day:%y%m%d}.html"
+
+
+def random_apod_day(latest: date, rng: random.Random | None = None) -> date:
+    return APOD_FIRST + timedelta(days=(rng or random).randrange((latest - APOD_FIRST).days + 1))
+
+
 # ───────────────────────────── API clients ─────────────────────────────
 
-@st.cache_resource
-def _session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=2,
-        status=3,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8))
-    return s
-
-
 def get_json(url: str, params: dict | None = None) -> Any:
-    try:
-        r = _session().get(
-            url,
-            params=params,
-            timeout=(3.05, TIMEOUT),
-            headers={"Accept": "application/json", "User-Agent": "NASA-Image-Explorer/1.0"},
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.Timeout as e:
-        raise ApiError("NASA's image service timed out. Please try again shortly.") from e
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "unknown"
-        raise ApiError(f"NASA's image service returned HTTP {status}. Please try again shortly.") from e
-    except ValueError as e:
-        raise ApiError("NASA's image service returned invalid JSON.") from e
-    except requests.RequestException as e:
-        raise ApiError("Could not connect to NASA's image service. Check your connection and try again.") from e
+    return _get_json(url, params, service="NASA's image service")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -283,6 +256,27 @@ def get_assets(nasa_id: str) -> dict[str, str]:
     return classify_assets(get_json(f"{API}/asset/{quote(str(nasa_id), safe='')}"))
 
 
+def nasa_api_key() -> str:
+    """NASA_API_KEY from .streamlit/secrets.toml or the environment; NASA's shared DEMO_KEY otherwise."""
+    try:
+        key = st.secrets.get("NASA_API_KEY", "")
+    except FileNotFoundError:                      # no secrets file at all
+        key = ""
+    return str(key or os.environ.get("NASA_API_KEY") or "DEMO_KEY")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_apod(day: str = "") -> dict:
+    """Astronomy Picture of the Day for an ISO date ('' = the most recent one)."""
+    params = {"api_key": nasa_api_key(), "thumbs": "true"}
+    if day:
+        params["date"] = day
+    item = parse_apod(_get_json(APOD_URL, params, service="NASA's Picture of the Day service"))
+    if item is None:
+        raise ApiError("NASA's Picture of the Day service returned an unexpected response.")
+    return item
+
+
 # ───────────────────────────── State and callbacks ─────────────────────────────
 
 ss = st.session_state
@@ -306,7 +300,7 @@ def init_state() -> None:
     qp = st.query_params
     initial_query = normalize_query(qp.get("q") or DEFAULT_QUERY)
     nasa_id = str(qp.get("id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", nasa_id):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", nasa_id):
         nasa_id = ""
     year_start = _query_int(qp, "from", MIN_YEAR, MIN_YEAR, THIS_YEAR)
     year_end = _query_int(qp, "to", THIS_YEAR, MIN_YEAR, THIS_YEAR)
@@ -324,6 +318,11 @@ def init_state() -> None:
     ss.setdefault("years", (year_start, year_end))
     ss.setdefault("center", center)
     ss.setdefault("sort", sort)
+    ss.setdefault("view", VIEWS[1] if qp.get("view") == "apod" else VIEWS[0])
+    try:
+        ss.setdefault("_apod_url_date", date.fromisoformat(str(qp.get("date") or "")))
+    except ValueError:
+        ss.setdefault("_apod_url_date", None)
 
 
 def reset_view() -> None:
@@ -363,13 +362,25 @@ def go_page(p: int) -> None:
     ss.page = p
 
 
+def apod_step(days: int) -> None:
+    ss.apod_pick = ss.apod_pick + timedelta(days=days)
+
+
+def apod_go(day: date) -> None:
+    ss.apod_pick = day
+
+
 def sync_query_params() -> None:
     """Keep search, filters, page, and detail selection shareable in the URL."""
     qp, q, sel = st.query_params, ss.query.strip(), ss.selected
     ys, ye = ss.get("years", (MIN_YEAR, THIS_YEAR))
     center = ss.get("center", "Any")
     sort = ss.get("sort", SORTS[0])
+    apod = ss.get("view") == VIEWS[1]
+    pick, latest = ss.get("apod_pick"), ss.get("_apod_latest")
     values = {
+        "view": "apod" if apod else None,
+        "date": pick.isoformat() if apod and pick and pick != latest else None,
         "q": q or None,
         "id": sel or None,
         "page": str(ss.page) if ss.page > 1 else None,
@@ -404,13 +415,10 @@ def render_controls() -> None:
     c3.selectbox("Sort this page", SORTS, key="sort")
     has_filters = ss.years != (MIN_YEAR, THIS_YEAR) or ss.center != "Any"
     c4.button("Reset filters", key="reset_filters", disabled=not has_filters, on_click=reset_filters)
-    chips = [*TOPICS, None]                       # None = the Surprise me button
-    for start in range(0, len(chips), 6):
-        for col, (i, topic) in zip(st.columns(6), enumerate(chips[start:start + 6], start)):
-            if topic is None:
-                col.button(":material/shuffle: Surprise me", key="surprise", on_click=surprise)
-            else:
-                col.button(topic, key=f"topic_{i}", on_click=search_for, args=(topic,))
+    with st.container(horizontal=True):
+        for i, topic in enumerate(TOPICS):
+            st.button(topic, key=f"topic_{i}", on_click=search_for, args=(topic,))
+        st.button("Surprise me", icon=":material/shuffle:", key="surprise", on_click=surprise)
 
 
 def pager(where: str, pages: int) -> None:
@@ -454,15 +462,16 @@ def render_results() -> None:
     kws = top_keywords(items, 8, exclude=query)
     if kws:
         st.caption("Explore related topics")
-        for col, (i, kw) in zip(st.columns(len(kws)), enumerate(kws)):
-            col.button(kw, key=f"kw_{i}", on_click=search_for, args=(kw,))
+        with st.container(horizontal=True):
+            for i, kw in enumerate(kws):
+                st.button(kw, key=f"kw_{i}", on_click=search_for, args=(kw,))
 
     pager("top", pages)
     shown = sort_items(items, ss.get("sort", SORTS[0]))
     for row in range(0, len(shown), 4):
         for k, (col, it) in enumerate(zip(st.columns(4), shown[row:row + 4])):
-            with col, st.container(border=True, key=f"card_{row + k}"):
-                st.image(it["thumb"], use_container_width=True, caption=md_escape(it["title"]))
+            with col, st.container(border=True, key=f"card_img_{row + k}"):
+                st.image(it["thumb"], width="stretch")
                 st.markdown(f"**{md_escape(shorten(it['title'], 60))}**")
                 st.caption(" · ".join(x for x in (it["date"][:4], it["center"]) if x) or " ")
                 st.button("View details", key=f"open_{it['nasa_id']}", on_click=open_detail,
@@ -493,7 +502,7 @@ def render_detail(nasa_id: str) -> None:
 
     left, right = st.columns([3, 2])
     with left:
-        st.image(pick_display(assets, item["thumb"]), use_container_width=True)
+        st.image(pick_display(assets, item["thumb"]), width="stretch")
     with right:
         st.subheader(md_escape(item["title"]))
         age = age_text(item["date"])
@@ -520,10 +529,9 @@ def render_detail(nasa_id: str) -> None:
 
     if item["keywords"]:
         st.markdown("#### Explore by keyword")
-        kws = item["keywords"][:12]
-        for start in range(0, len(kws), 6):
-            for col, (i, kw) in zip(st.columns(6), enumerate(kws[start:start + 6], start)):
-                col.button(kw, key=f"dkw_{i}", on_click=search_for, args=(kw,))
+        with st.container(horizontal=True):
+            for i, kw in enumerate(item["keywords"][:12]):
+                st.button(kw, key=f"dkw_{i}", on_click=search_for, args=(kw,))
         try:
             related = [r for r in search_images(item["keywords"][0], 1, page_size=9)["items"]
                        if r["nasa_id"] != nasa_id][:4]
@@ -533,26 +541,91 @@ def render_detail(nasa_id: str) -> None:
             st.markdown(f"#### More like this: {md_escape(item['keywords'][0])}")
             for k, (col, r) in enumerate(zip(st.columns(4), related)):
                 with col, st.container(border=True, key=f"card_rel_{k}"):
-                    st.image(r["thumb"], use_container_width=True)
+                    st.image(r["thumb"], width="stretch")
                     st.caption(md_escape(shorten(r["title"], 60)))
                     st.button("View", key=f"rel_{r['nasa_id']}", on_click=open_detail,
                               args=(r["nasa_id"], r))
 
 
+def render_apod() -> None:
+    try:
+        with st.spinner("Fetching today's picture…"):
+            latest = get_apod()
+    except ApiError as e:
+        st.error(f"Could not load the Astronomy Picture of the Day. {e}")
+        if nasa_api_key() == "DEMO_KEY":
+            st.caption("This app is using NASA's shared DEMO_KEY, which allows only a few requests per hour. Get a free key at "
+                       "[api.nasa.gov](https://api.nasa.gov) and set it as `NASA_API_KEY` in `.streamlit/secrets.toml` or the environment.")
+        return
+    last = latest["date"]
+    ss["_apod_latest"] = last
+    if "apod_pick" not in ss:
+        ss.apod_pick = ss.get("_apod_url_date") or last
+    ss.apod_pick = min(last, max(APOD_FIRST, ss.apod_pick))
+
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        st.button("← Previous day", key="apod_prev", disabled=ss.apod_pick <= APOD_FIRST, on_click=apod_step, args=(-1,))
+        st.date_input("Date", key="apod_pick", min_value=APOD_FIRST, max_value=last, width=170)
+        st.button("Next day →", key="apod_next", disabled=ss.apod_pick >= last, on_click=apod_step, args=(1,))
+        st.button("Latest", key="apod_latest", disabled=ss.apod_pick == last, on_click=apod_go, args=(last,))
+        st.button("Random day", icon=":material/shuffle:", key="apod_random", on_click=apod_go, args=(random_apod_day(last),))
+
+    day = ss.apod_pick
+    try:
+        item = latest if day == last else get_apod(day.isoformat())
+    except ApiError as e:
+        st.error(f"Could not load the picture for {day:%d %B %Y}. {e}")
+        return
+
+    left, right = st.columns([3, 2])
+    with left:
+        if item["media_type"] == "image" and item["url"]:
+            st.image(item["url"], width="stretch")
+        elif item["media_type"] == "video" and item["url"]:
+            try:
+                st.video(item["url"])
+            except Exception:                      # an embed type st.video can't play: show its thumbnail instead
+                if item["thumb"]:
+                    st.image(item["thumb"], width="stretch")
+                st.link_button("Watch the video", item["url"])
+        elif item["thumb"]:
+            st.image(item["thumb"], width="stretch")
+        else:
+            st.info("This day's entry is interactive or a format that can't be shown here. Open it on NASA's site.")
+    with right:
+        st.subheader(md_escape(item["title"]))
+        age = age_text(day.isoformat())
+        st.markdown(facts_html([
+            ("Date", f"{day:%d %B %Y}" + (f" · {age}" if age and day != last else " · today's picture" if day == last else "")),
+            ("Credit", item["credit"] or "Public domain (NASA)"),
+            ("Type", item["media_type"].title()),
+        ]), unsafe_allow_html=True)
+        with st.container(horizontal=True):
+            if item["hdurl"]:
+                st.link_button("Full resolution", item["hdurl"])
+            st.link_button("Open on apod.nasa.gov", apod_page(day))
+        st.markdown(md_escape(item["explanation"] or "No explanation available."))
+    st.caption("Astronomy Picture of the Day is curated by NASA since 16 June 1995. The page URL points to this date, so you can share it.")
+
+
 def main() -> None:
-    st.set_page_config(page_title="NASA Image Explorer", page_icon="🌌", layout="wide")
+    st.set_page_config(page_title="NASA Image Explorer", page_icon="🔭", layout="wide")
     init_state()
     eyebrow("NASA image library")
     st.title("NASA Image Explorer")
-    st.caption("Search NASA's public image library, filter by year and center, and open any image for the full story.")
-    st.text_input("Search", key="query", max_chars=MAX_QUERY_CHARS, on_change=reset_view,
-                  label_visibility="collapsed",
-                  placeholder="Search NASA's image library: nebula, apollo 11, mars rover…")
-    if ss.selected:
-        render_detail(ss.selected)
+    st.caption("Search NASA's public image library, or browse 30 years of the Astronomy Picture of the Day.")
+    st.segmented_control("View", VIEWS, key="view", required=True, label_visibility="collapsed", on_change=close_detail)
+    if ss.view == VIEWS[1]:
+        render_apod()
     else:
-        render_controls()
-        render_results()
+        st.text_input("Search", key="query", max_chars=MAX_QUERY_CHARS, on_change=reset_view,
+                      label_visibility="collapsed",
+                      placeholder="Search NASA's image library: nebula, apollo 11, mars rover…")
+        if ss.selected:
+            render_detail(ss.selected)
+        else:
+            render_controls()
+            render_results()
     sync_query_params()
 
 

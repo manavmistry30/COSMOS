@@ -10,14 +10,11 @@ from typing import Any
 import altair as alt
 import pandas as pd
 import pydeck as pdk
-import requests
 import streamlit as st
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
+from common import ApiError, get_json as _get_json, location_input
 from theme import eyebrow, facts_html
 
-TIMEOUT = 15
 SWPC = "https://services.swpc.noaa.gov"
 KP_URL = SWPC + "/products/noaa-planetary-k-index-forecast.json"      # observed + estimated + 3-day predicted, 3-hourly
 KP_1M_URL = SWPC + "/json/planetary_k_index_1m.json"                   # 1-minute estimated Kp
@@ -42,29 +39,7 @@ CORONAGRAPH = "https://soho.nascom.nasa.gov/data/realtime/c3/1024/latest.jpg"
 G_SCALE = [(9, "G5 Extreme"), (8, "G4 Severe"), (7, "G3 Strong"), (6, "G2 Moderate"), (5, "G1 Minor")]
 
 
-class ApiError(Exception):
-    pass
-
-
 # ───────────────────────────── Pure helpers (no I/O) ─────────────────────────────
-
-def _valid_latlon(lat: float, lon: float) -> bool:
-    return (math.isfinite(lat) and math.isfinite(lon)
-            and -90 <= lat <= 90 and -180 <= lon <= 180)
-
-
-def parse_latlon(text: str) -> tuple[float, float] | None:
-    try:
-        if not isinstance(text, str):
-            return None
-        parts = re.split(r"[,;]", text)
-        if len(parts) != 2:
-            return None
-        lat, lon = (float(x.strip()) for x in parts)
-    except (TypeError, ValueError):
-        return None
-    return (lat, lon) if _valid_latlon(lat, lon) else None
-
 
 def parse_time(s: Any) -> datetime | None:
     """NOAA time tags, with or without a trailing Z or fractional seconds -> aware UTC datetime."""
@@ -150,32 +125,8 @@ def chance_words(p: int) -> str:
 
 # ───────────────────────────── API clients ─────────────────────────────
 
-@st.cache_resource
-def _session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=3, connect=3, read=2, status=3, backoff_factor=0.6,
-                  status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET"}),
-                  respect_retry_after_header=True)
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
-    s.mount("https://", adapter)
-    return s
-
-
 def get_json(url: str) -> Any:
-    try:
-        r = _session().get(url, timeout=(3.05, TIMEOUT),
-                           headers={"Accept": "application/json", "User-Agent": "COSMOS-SpaceWeather/1.0"})
-        r.raise_for_status()
-        return r.json()
-    except requests.Timeout as e:
-        raise ApiError("NOAA's space-weather service timed out. Try again shortly.") from e
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "unknown"
-        raise ApiError(f"NOAA's space-weather service returned HTTP {status}.") from e
-    except ValueError as e:
-        raise ApiError("NOAA's space-weather service returned invalid JSON.") from e
-    except requests.RequestException as e:
-        raise ApiError("Could not connect to NOAA's space-weather service. Check the connection and try again.") from e
+    return _get_json(url, service="NOAA's space-weather service")
 
 
 def _rows(url: str) -> list[dict]:
@@ -376,10 +327,7 @@ def render_aurora() -> None:
     except ApiError as e:
         st.error(f"Could not load the aurora forecast. {e}")
         return
-    text = st.text_input("Your latitude, longitude", placeholder="e.g. 64.1, -21.9  (Reykjavík)", key="aurora_me")
-    me = parse_latlon(text) if text else None
-    if text and me is None:
-        st.warning("Enter two numbers like `64.1, -21.9` (latitude -90 to 90, longitude -180 to 180).")
+    me = location_input("aurora_me", placeholder="e.g. 64.1, -21.9  (Reykjavík)")
     if me:
         p = lookup_aurora(aur["grid"], *me)
         a, b = st.columns([1, 3])
@@ -404,10 +352,10 @@ def render_sun() -> None:
     bust = int(time.time() // 900)                      # new image URL every 15 min so browsers fetch the update
     a, b = st.columns(2)
     with a:
-        st.image(f"{SDO.format(code)}?t={bust}", use_container_width=True)
+        st.image(f"{SDO.format(code)}?t={bust}", width="stretch")
         st.caption(f"NASA SDO · {note}")
     with b:
-        st.image(f"{CORONAGRAPH}?t={bust}", use_container_width=True)
+        st.image(f"{CORONAGRAPH}?t={bust}", width="stretch")
         st.caption("SOHO LASCO C3 coronagraph. The Sun is blocked out; bright clouds leaving it are coronal mass ejections (CMEs), "
                    "which can trigger storms 1-4 days later.")
 
@@ -430,8 +378,8 @@ def render_charts() -> None:
             w = get_solar_wind().reset_index()
             w.columns = ["time", "speed", "density", "bz", "bt"]
             a, b = st.columns(2)
-            a.altair_chart(_time_chart(w.dropna(subset=["speed"]), "speed", "#ff9f43", "Solar wind (km/s)"), use_container_width=True)
-            b.altair_chart(_time_chart(w.dropna(subset=["bz"]), "bz", "#6ea8ff", "Bz (nT)", zero=True), use_container_width=True)
+            a.altair_chart(_time_chart(w.dropna(subset=["speed"]), "speed", "#ff9f43", "Solar wind (km/s)"), width="stretch")
+            b.altair_chart(_time_chart(w.dropna(subset=["bz"]), "bz", "#6ea8ff", "Bz (nT)", zero=True), width="stretch")
             st.caption("1-minute data from the active NOAA solar-wind spacecraft at L1. Long stretches of negative Bz with fast wind are what build storms.")
         except ApiError as e:
             st.warning(f"Solar-wind history unavailable. {e}")
@@ -444,7 +392,7 @@ def render_charts() -> None:
                 color=alt.Color("status:N", scale=colors, legend=alt.Legend(orient="top", title=None)),
                 tooltip=[alt.Tooltip("time:T", format="%d %b %H:%M"), "Kp:Q", "status:N"])
             storm = alt.Chart(pd.DataFrame({"y": [5]})).mark_rule(color="#ff6b6b", strokeDash=[4, 4]).encode(y="y:Q")
-            st.altair_chart((bars + storm).properties(height=240), use_container_width=True)
+            st.altair_chart((bars + storm).properties(height=240), width="stretch")
             st.caption("3-hourly Kp: the past week plus NOAA's 3-day forecast. Above the red line (Kp 5) is a geomagnetic storm.")
         except ApiError as e:
             st.warning(f"Kp history unavailable. {e}")
@@ -454,7 +402,7 @@ def render_charts() -> None:
             ticks = pd.DataFrame({"y": [1e-6, 1e-5, 1e-4], "label": ["C", "M", "X"]})
             rules = alt.Chart(ticks).mark_rule(color="#5d6778", strokeDash=[2, 4]).encode(y="y:Q")
             labels = alt.Chart(ticks).mark_text(align="left", dx=4, dy=-6, color="#8b95a7").encode(y="y:Q", text="label:N", x=alt.value(0))
-            st.altair_chart(_time_chart(xr, "flux", "#ffd166", "X-ray flux (W/m²)", log=True) + rules + labels, use_container_width=True)
+            st.altair_chart(_time_chart(xr, "flux", "#ffd166", "X-ray flux (W/m²)", log=True) + rules + labels, width="stretch")
             st.caption("GOES long-wave X-rays. Spikes are solar flares; crossing the M line can cause radio blackouts on Earth's dayside.")
         except ApiError as e:
             st.warning(f"X-ray history unavailable. {e}")
